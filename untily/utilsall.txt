@@ -1,0 +1,243 @@
+
+import pickle as pkl
+import networkx as nx
+import scipy.sparse as sp
+from scipy.sparse.linalg.eigen.arpack import eigsh
+import sys
+import torch
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+def parse_index_file(filename):
+    """Parse index file."""
+    index = []
+    for line in open(filename):
+        index.append(int(line.strip()))
+    return index
+
+
+def sample_mask(idx, l):
+    """Create mask."""
+    mask = np.zeros(l)
+    mask[idx] = 1
+    return np.array(mask, dtype=np.bool)
+
+import random
+
+def normalize_adj(adj):
+    """Symmetrically normalize adjacency matrix using torch."""
+    # 检查是否为稀疏矩阵，仅在是稀疏矩阵时转换为密集矩阵
+    if adj.is_sparse:
+        adj = adj.to_dense()
+
+    # 计算每一行的和
+    rowsum = torch.sum(adj, dim=1, keepdim=True)
+
+    # 计算 D^(-0.5)
+    d_inv_sqrt = torch.pow(rowsum, -0.5)
+    d_inv_sqrt[torch.isinf(d_inv_sqrt)] = 0.
+
+    # 创建对角矩阵 D^(-0.5)
+    d_mat_inv_sqrt = torch.diag_embed(d_inv_sqrt.squeeze())
+
+    # 计算归一化后的邻接矩阵
+    normalized_adj = torch.matmul(torch.matmul(adj, d_mat_inv_sqrt).transpose(-2, -1), d_mat_inv_sqrt)
+
+    # 如果原始输入是稀疏矩阵，将结果转换回稀疏矩阵
+    if adj.is_sparse:
+        normalized_adj = normalized_adj.to_sparse()
+
+    return normalized_adj
+
+def load_data(dataset_str):
+
+    metabolite_data = pd.read_excel('datee/所有代谢物的定量.xlsx')
+    data_keys = metabolite_data.keys()[1:]
+
+    selected_keys = []
+    for i in range(0, len(data_keys), 5):
+        group = data_keys[i:i + 5].tolist()  # 将 pandas.Index 对象转换为列表
+        if len(group) >= 3:
+            selected = random.sample(group, 3)
+            selected_keys.extend(selected)
+
+    metabolite_features = metabolite_data[selected_keys]
+
+    transcriptome_data = pd.read_excel('datee/转录组基因表达量.xlsx')
+
+    transcriptome_features = transcriptome_data.drop(columns=['#ID'])
+    pca = PCA(n_components=30)
+    metabolite_features_pca = pca.fit_transform(metabolite_features)
+    transcriptome_features_pca = pca.fit_transform(transcriptome_features)
+
+    from sklearn.metrics.pairwise import cosine_similarity
+
+    similarity_matrix = cosine_similarity(metabolite_features_pca, metabolite_features_pca)
+    ###############################################################
+    top_n = 30    # 为每个节点选择相似度最高的前 100 个节点
+    top_nodes = []
+    for row in similarity_matrix:        # 获取当前行中元素的索引，并按相似度降序排序
+        sorted_indices = np.argsort(row)[::-1]        # 选择前 100 个节点的索引
+        top_indices = sorted_indices[:top_n]
+        top_nodes.append(top_indices)
+    # 构建边
+    edges = []
+    for source_node, target_nodes in enumerate(top_nodes):
+        for target_node in target_nodes:
+            # 避免自环（如果需要可以保留自环，去掉这个条件判断）
+            if source_node != target_node:
+                edges.append([source_node, target_node])
+                edges.append([target_node, source_node])
+    ###############################################################
+    # 将结果转换为 numpy 数组
+    edges_metabolite = np.array(edges)
+
+    similarity_matrix = cosine_similarity(transcriptome_features_pca, transcriptome_features_pca)
+
+    top_n = 30  # 为每个节点选择相似度最高的前 100 个节点
+    top_nodes = []
+    for row in similarity_matrix:  # 获取当前行中元素的索引，并按相似度降序排序
+        sorted_indices = np.argsort(row)[::-1]  # 选择前 100 个节点的索引
+        top_indices = sorted_indices[:top_n]
+        top_nodes.append(top_indices)
+    # 构建边
+    edges = []
+    for source_node, target_nodes in enumerate(top_nodes):
+        for target_node in target_nodes:
+            if source_node != target_node:
+                edges.append([source_node, target_node])
+                edges.append([target_node, source_node])
+
+    edges_transcriptome = np.array(edges)
+
+    similarity_matrix = cosine_similarity(transcriptome_features_pca, metabolite_features_pca)
+
+    top_n = 30  # 为每个节点选择相似度最高的前 100 个节点
+    top_nodes = []
+    for row in similarity_matrix:  # 获取当前行中元素的索引，并按相似度降序排序
+        sorted_indices = np.argsort(row)[::-1]  # 选择前 100 个节点的索引
+        top_indices = sorted_indices[:top_n]
+        top_nodes.append(top_indices)
+    # 构建边
+    edges = []
+    for source_node, target_nodes in enumerate(top_nodes):
+        for target_node in target_nodes:
+            if source_node != target_node:
+                edges.append([source_node, target_node])
+                edges.append([target_node, source_node])
+
+    edges = np.array(edges)
+
+    edges_metabolite = edges_metabolite + edges_transcriptome.max() + 1
+    edges[:, 1] = edges[:, 1] + len(transcriptome_features_pca)
+
+    # edges_all = np.concatenate([edges_transcriptome, edges_metabolite, edges], axis=0)
+    edges_all = np.concatenate([edges], axis=0)
+
+    feature_all = np.concatenate([transcriptome_features_pca, metabolite_features_pca], axis=0)
+
+    relations = [torch.ones(len(edge))*idx for idx, edge in enumerate([edges_transcriptome, edges_metabolite, edges])]
+    # PyG要求格式为 [2, edge_num]
+    edge_index = edges_all.T
+
+    values = np.ones(len(edges_all))
+
+    adj_sp = torch.sparse_coo_tensor(indices=edge_index, values=torch.FloatTensor(values), size=[len(feature_all), len(feature_all)])
+
+    adj_dense = adj_sp.to_dense()
+
+    normalized_adj = normalize_adj(adj_dense)
+
+    relations = torch.cat(relations)
+
+    edge_index = torch.LongTensor(edge_index)
+    feature_all = torch.FloatTensor(np.array(feature_all))
+    relations = torch.tensor(relations, dtype=torch.long)
+
+    metab = metabolite_data['ID'].values
+    trans = transcriptome_data['#ID'].values
+
+    org_index = np.concatenate([trans, metab])
+
+    return edge_index, feature_all, relations, normalized_adj, org_index, len(transcriptome_features_pca)
+
+
+def sparse_to_tuple(sparse_mx):
+    """Convert sparse matrix to tuple representation."""
+    def to_tuple(mx):
+        if not sp.isspmatrix_coo(mx):
+            mx = mx.tocoo()
+        coords = np.vstack((mx.row, mx.col)).transpose()
+        values = mx.data
+        shape = mx.shape
+        return coords, values, shape
+
+    if isinstance(sparse_mx, list):
+        for i in range(len(sparse_mx)):
+            sparse_mx[i] = to_tuple(sparse_mx[i])
+    else:
+        sparse_mx = to_tuple(sparse_mx)
+
+    return sparse_mx
+
+
+def preprocess_features(features):
+    """Row-normalize feature matrix and convert to tuple representation"""
+    rowsum = np.array(features.sum(1))
+    r_inv = np.power(rowsum, -1).flatten()
+    r_inv[np.isinf(r_inv)] = 0.
+    r_mat_inv = sp.diags(r_inv)
+    features = r_mat_inv.dot(features)
+    return sparse_to_tuple(features)
+
+
+
+#
+# def normalize_adj(adj):
+#     """Symmetrically normalize adjacency matrix."""
+#     adj = sp.coo_matrix(adj)
+#     rowsum = np.array(adj.sum(1))
+#     d_inv_sqrt = np.power(rowsum, -0.5).flatten()
+#     d_inv_sqrt[np.isinf(d_inv_sqrt)] = 0.
+#     d_mat_inv_sqrt = sp.diags(d_inv_sqrt)
+#     return adj.dot(d_mat_inv_sqrt).transpose().dot(d_mat_inv_sqrt).tocoo()
+
+
+def preprocess_adj(adj):
+    """Preprocessing of adjacency matrix for simple GCN model and conversion to tuple representation."""
+    adj_normalized = normalize_adj(adj + sp.eye(adj.shape[0]))
+    return sparse_to_tuple(adj_normalized)
+
+
+def construct_feed_dict(features, support, labels, labels_mask, placeholders):
+    """Construct feed dictionary."""
+    feed_dict = dict()
+    feed_dict.update({placeholders['labels']: labels})
+    feed_dict.update({placeholders['labels_mask']: labels_mask})
+    feed_dict.update({placeholders['features']: features})
+    feed_dict.update({placeholders['support'][i]: support[i] for i in range(len(support))})
+    feed_dict.update({placeholders['num_features_nonzero']: features[1].shape})
+    return feed_dict
+
+
+def chebyshev_polynomials(adj, k):
+    """Calculate Chebyshev polynomials up to order k. Return a list of sparse matrices (tuple representation)."""
+    print("Calculating Chebyshev polynomials up to order {}...".format(k))
+
+    adj_normalized = normalize_adj(adj)
+    laplacian = sp.eye(adj.shape[0]) - adj_normalized
+    largest_eigval, _ = eigsh(laplacian, 1, which='LM')
+    scaled_laplacian = (2. / largest_eigval[0]) * laplacian - sp.eye(adj.shape[0])
+
+    t_k = list()
+    t_k.append(sp.eye(adj.shape[0]))
+    t_k.append(scaled_laplacian)
+
+    def chebyshev_recurrence(t_k_minus_one, t_k_minus_two, scaled_lap):
+        s_lap = sp.csr_matrix(scaled_lap, copy=True)
+        return 2 * s_lap.dot(t_k_minus_one) - t_k_minus_two
+
+    for i in range(2, k+1):
+        t_k.append(chebyshev_recurrence(t_k[-1], t_k[-2], scaled_laplacian))
+
+    return sparse_to_tuple(t_k)
